@@ -195,6 +195,165 @@ Add requirements.txt for easy installs.
 Add a LICENSE (e.g., MIT) if you want to open-source.
 
 Minimal requirements.txt (put in repo)
+
+
+
+# -*- coding: utf-8 -*-
+# 🚀 Machine Unlearning Demo (Mini BERT)
+# Author: K953
+# Goal: Demonstrate how a model can "forget" specific data (Df)
+# Dataset: Simple toy sentences
+
+!pip install transformers torch accelerate -q
+
+import torch
+import torch.nn.functional as F
+from transformers import AutoTokenizer, AutoModelForMaskedLM, Trainer, TrainingArguments, DataCollatorForLanguageModeling
+from datasets import Dataset
+import random
+
+# ==========================
+# 1️⃣ Create Synthetic Dataset
+# ==========================
+data_D = [
+    "The cat sits on the mat.",
+    "Dogs are loyal animals.",
+    "Paris is the capital of France.",
+    "Apples are red and tasty.",
+    "AI models learn from data."
+]
+
+data_Df = [
+    "Aliens live on the moon.",        # ❌ False / to forget
+    "The earth is flat.",              # ❌ False / to forget
+]
+
+# Dr = Remaining clean data (D without Df)
+data_Dr = data_D.copy()
+
+# ==========================
+# 2️⃣ Initialize Model and Tokenizer
+# ==========================
+model_name = "distilbert-base-uncased"
+tokenizer = AutoTokenizer.from_pretrained(model_name)
+
+def tokenize_fn(examples):
+    return tokenizer(examples["text"], truncation=True, padding="max_length", max_length=32)
+
+def make_dataset(text_list):
+    return Dataset.from_dict({"text": text_list}).map(tokenize_fn, batched=True)
+
+ds_D = make_dataset(data_D + data_Df)
+ds_Dr = make_dataset(data_Dr)
+ds_Df = make_dataset(data_Df)
+
+# ==========================
+# 3️⃣ Fine-tune on D (All data)
+# ==========================
+model_D = AutoModelForMaskedLM.from_pretrained(model_name)
+collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=True, mlm_probability=0.15)
+
+args = TrainingArguments(
+    output_dir="./out_D",
+    per_device_train_batch_size=4,
+    num_train_epochs=1,
+    logging_steps=5,
+    save_strategy="no",
+)
+
+trainer = Trainer(model=model_D, args=args, train_dataset=ds_D, data_collator=collator)
+trainer.train()
+
+# ==========================
+# 4️⃣ Fine-tune on Df (to forget)
+# ==========================
+model_Df = AutoModelForMaskedLM.from_pretrained(model_name)
+trainer = Trainer(model=model_Df, args=args, train_dataset=ds_Df, data_collator=collator)
+trainer.train()
+
+# ==========================
+# 5️⃣ Fine-tune on Dr (remaining clean)
+# ==========================
+model_Dr = AutoModelForMaskedLM.from_pretrained(model_name)
+trainer = Trainer(model=model_Dr, args=args, train_dataset=ds_Dr, data_collator=collator)
+trainer.train()
+
+# ==========================
+# 6️⃣ Compare model predictions
+# ==========================
+def get_logits(model, text):
+    inputs = tokenizer(text, return_tensors="pt")
+    with torch.no_grad():
+        outputs = model(**inputs)
+    return outputs.logits
+
+test_sentence = "The earth is [MASK]."
+logits_D = get_logits(model_D, test_sentence)
+logits_Dr = get_logits(model_Dr, test_sentence)
+logits_Df = get_logits(model_Df, test_sentence)
+
+# Compute KL Divergences
+def kl_divergence(logits1, logits2):
+    probs1 = F.log_softmax(logits1, dim=-1)
+    probs2 = F.log_softmax(logits2, dim=-1)
+    return F.kl_div(probs1, probs2, reduction="batchmean")
+
+KL_D_Dr = kl_divergence(logits_D, logits_Dr)
+KL_D_Df = kl_divergence(logits_D, logits_Df)
+
+print(f"\nKL(D vs Dr)  →  {KL_D_Dr.item():.4f} (difference from clean)")
+print(f"KL(D vs Df)  →  {KL_D_Df.item():.4f} (similarity with forget data)\n")
+
+# ==========================
+# 7️⃣ Unlearning Step — Reverse Fine-tuning on Df
+# ==========================
+model_unlearned = AutoModelForMaskedLM.from_pretrained("./out_D")  # copy of D
+optimizer = torch.optim.AdamW(model_unlearned.parameters(), lr=5e-5)
+
+loader = torch.utils.data.DataLoader(ds_Df, batch_size=2, shuffle=True)
+
+print("🔁 Applying reverse gradient updates on Df to 'forget'...")
+
+model_unlearned.train()
+for epoch in range(1):  # 1 epoch for demo
+    for batch in loader:
+        optimizer.zero_grad()
+        inputs = {k: v for k, v in batch.items() if k in ['input_ids', 'attention_mask']}
+        outputs = model_unlearned(**inputs, labels=inputs["input_ids"])
+        loss = outputs.loss
+        (-loss).backward()  # Reverse gradient direction
+        optimizer.step()
+
+print("✅ Unlearning complete!")
+
+# ==========================
+# 8️⃣ Evaluate after Unlearning
+# ==========================
+logits_Unlearned = get_logits(model_unlearned, test_sentence)
+KL_Unlearned_Dr = kl_divergence(logits_Unlearned, logits_Dr)
+
+print(f"\nKL(Unlearned vs Dr) → {KL_Unlearned_Dr.item():.4f}")
+print(f"Before: KL(D vs Dr) = {KL_D_Dr.item():.4f}")
+print("Lower KL → model is behaving more like the clean model ✅")
+
+# ==========================
+# 9️⃣ View top predicted words for the [MASK]
+# ==========================
+def top_predictions(model, text, k=3):
+    inputs = tokenizer(text, return_tensors="pt")
+    mask_index = (inputs["input_ids"] == tokenizer.mask_token_id).nonzero(as_tuple=True)[1]
+    with torch.no_grad():
+        logits = model(**inputs).logits
+    probs = F.softmax(logits, dim=-1)
+    top_k = torch.topk(probs[0, mask_index], k)
+    tokens = [tokenizer.decode([idx]) for idx in top_k.indices[0]]
+    return tokens
+
+print("\nTop predicted words for:", test_sentence)
+print("Model D:", top_predictions(model_D, test_sentence))
+print("Model Dr:", top_predictions(model_Dr, test_sentence))
+print("Model after Unlearning:", top_predictions(model_unlearned, test_sentence))
+
 transformers>=4.0.0
 torch
 accelerate
